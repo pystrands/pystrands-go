@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"net"
 	"sync"
+	"time"
 )
 
 // ServerRequest is a request from the backend to the ws server to perform a specific action(and might return a response)
@@ -37,13 +38,22 @@ type BackendResponse struct {
 	Params    map[string]any `json:"params"`
 }
 
+const (
+	// HeartbeatInterval is how often the server pings TCP backends
+	HeartbeatInterval = 15 * time.Second
+	// HeartbeatTimeout is how long to wait for a pong before considering the backend dead
+	HeartbeatTimeout = 5 * time.Second
+)
+
 // TCPServer represents a TCP server instance
 type TCPServer struct {
 	listener              net.Listener
 	Clients               []net.Conn
 	mu                    sync.Mutex
+	pendingMu             sync.Mutex                     // protects PendingResponses map
 	PendingServerRequests chan BackendAction              // Requests from the backend(python) to the server
 	PendingResponses      map[string]chan BackendResponse // Responses pending from the backend(python)
+	done                  chan struct{}                   // signals shutdown
 
 	WebsocketActions map[ServerActions]func(map[string]any)
 }
@@ -52,8 +62,9 @@ type TCPServer struct {
 func NewTCPServer() *TCPServer {
 	server := &TCPServer{
 		Clients:               make([]net.Conn, 0),
-		PendingServerRequests: make(chan BackendAction),
+		PendingServerRequests: make(chan BackendAction, 256),
 		PendingResponses:      make(map[string]chan BackendResponse),
+		done:                  make(chan struct{}),
 	}
 	return server
 }
@@ -69,11 +80,20 @@ func (s *TCPServer) Start(address string) error {
 
 	go s.acceptConnections()
 	go s.HandleRequests()
+	go s.heartbeatLoop()
 	return nil
 }
 
 // Stop gracefully shuts down the TCP server
 func (s *TCPServer) Stop() error {
+	// Signal shutdown
+	select {
+	case <-s.done:
+		// Already closed
+	default:
+		close(s.done)
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -115,22 +135,32 @@ func (s *TCPServer) handleConnection(conn net.Conn) {
 
 	for {
 		message, err := reader.ReadString('\n')
-		log.Println("Received message", message)
 		if err != nil {
+			select {
+			case <-s.done:
+				return
+			default:
+			}
 			log.Printf("Error reading message: %v", err)
 			return
 		}
 
-		log.Println("Marshalled message", message)
+		log.Println("Received message", message)
+
 		var request ServerRequest
 		err = json.Unmarshal([]byte(message), &request)
 		if err != nil {
 			log.Printf("Error unmarshalling message: %v", err)
-			return
+			continue // don't kill connection on bad JSON, skip
 		}
-		s.PendingServerRequests <- BackendAction{
+
+		select {
+		case s.PendingServerRequests <- BackendAction{
 			ServerRequest: request,
 			conn:          conn,
+		}:
+		case <-s.done:
+			return
 		}
 	}
 }
@@ -140,6 +170,11 @@ func (s *TCPServer) acceptConnections() {
 	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
+			select {
+			case <-s.done:
+				return
+			default:
+			}
 			log.Printf("Error accepting connection: %v", err)
 			continue
 		}
@@ -152,7 +187,66 @@ func (s *TCPServer) acceptConnections() {
 	}
 }
 
-// sendMessage sends a message to the client
+// heartbeatLoop periodically pings all TCP backend connections
+func (s *TCPServer) heartbeatLoop() {
+	ticker := time.NewTicker(HeartbeatInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.done:
+			return
+		case <-ticker.C:
+			s.pingBackends()
+		}
+	}
+}
+
+// pingBackends sends a heartbeat ping to all connected backends
+func (s *TCPServer) pingBackends() {
+	s.mu.Lock()
+	clients := make([]net.Conn, len(s.Clients))
+	copy(clients, s.Clients)
+	s.mu.Unlock()
+
+	ping := BackendRequest{
+		RequestID: "heartbeat",
+		Action:    BackendActionHeartbeat,
+		Params:    map[string]any{},
+	}
+	data, err := json.Marshal(ping)
+	if err != nil {
+		return
+	}
+	msg := string(data) + "\n"
+
+	var dead []net.Conn
+	for _, conn := range clients {
+		conn.SetWriteDeadline(time.Now().Add(HeartbeatTimeout))
+		_, err := conn.Write([]byte(msg))
+		conn.SetWriteDeadline(time.Time{}) // reset
+		if err != nil {
+			log.Printf("Backend heartbeat failed for %s: %v", conn.RemoteAddr(), err)
+			dead = append(dead, conn)
+		}
+	}
+
+	if len(dead) > 0 {
+		s.mu.Lock()
+		for _, d := range dead {
+			for i, c := range s.Clients {
+				if c == d {
+					s.Clients = append(s.Clients[:i], s.Clients[i+1:]...)
+					d.Close()
+					break
+				}
+			}
+		}
+		s.mu.Unlock()
+	}
+}
+
+// sendMessage sends a message to a random backend client
 func (s *TCPServer) sendMessage(_message BackendRequest) error {
 	message, err := json.Marshal(_message)
 	if err != nil {
@@ -170,7 +264,6 @@ func (s *TCPServer) sendMessage(_message BackendRequest) error {
 
 // GetRandomConnection returns a random connection from the active clients
 func (s *TCPServer) GetRandomConnection() (net.Conn, bool) {
-	log.Println("Getting random connection")
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -180,6 +273,5 @@ func (s *TCPServer) GetRandomConnection() (net.Conn, bool) {
 	}
 
 	randomIndex := rand.Intn(len(s.Clients))
-	log.Println("Random connection", randomIndex)
 	return s.Clients[randomIndex], true
 }

@@ -23,12 +23,19 @@ const (
 	BackendActionDisconnected      BackendActions = "disconnected"
 	BackendActionConnectionSuccess BackendActions = "new_connection"
 	BackendActionError             BackendActions = "error"
+	BackendActionHeartbeat         BackendActions = "heartbeat"
 )
 
-// tells if the connection should be accepted or not
+// NewSocketConnection tells the backend about a new connection and waits for approval
 func (s *TCPServer) NewSocketConnection(headers map[string][]string, url string, remoteAddr string) (map[string]any, error) {
-	// random connection from pool server clients
 	requestID := uuid.New().String()
+
+	// Create the response channel before sending, under lock
+	responseCh := make(chan BackendResponse, 1)
+	s.pendingMu.Lock()
+	s.PendingResponses[requestID] = responseCh
+	s.pendingMu.Unlock()
+
 	err := s.sendMessage(BackendRequest{
 		RequestID: requestID,
 		Action:    BackendActionConnectionRequest,
@@ -39,13 +46,20 @@ func (s *TCPServer) NewSocketConnection(headers map[string][]string, url string,
 		},
 	})
 	if err != nil {
+		s.pendingMu.Lock()
+		delete(s.PendingResponses, requestID)
+		s.pendingMu.Unlock()
 		return nil, err
 	}
-	s.PendingResponses[requestID] = make(chan BackendResponse)
+
 	log.Println("Sent request to backend:", requestID, BackendActionConnectionRequest)
-	response := <-s.PendingResponses[requestID]
+	response := <-responseCh
 	log.Println("Received response channel:", response.RequestID, response.Action)
+
+	s.pendingMu.Lock()
 	delete(s.PendingResponses, requestID)
+	s.pendingMu.Unlock()
+
 	return response.Params, nil
 }
 
@@ -88,21 +102,36 @@ func (s *TCPServer) HandleError(context map[string]any, errorMessage string) {
 	})
 }
 
-// Accepts a socket connection
+// HandleRequests processes incoming requests from TCP backends
 func (s *TCPServer) HandleRequests() {
-	for request := range s.PendingServerRequests {
-		log.Println("Received request:", request.RequestID, request.Action, request.Params)
-		switch request.Action {
-		case ServerActionResponse:
-			s.PendingResponses[request.RequestID] <- BackendResponse{
-				RequestID: request.RequestID,
-				Action:    ServerActionResponse,
-				Params:    request.Params,
+	for {
+		select {
+		case request, ok := <-s.PendingServerRequests:
+			if !ok {
+				return
 			}
-		default:
-			if action, ok := s.WebsocketActions[request.Action]; ok {
-				action(request.Params)
+			log.Println("Received request:", request.RequestID, request.Action, request.Params)
+			switch request.Action {
+			case ServerActionResponse:
+				s.pendingMu.Lock()
+				ch, exists := s.PendingResponses[request.RequestID]
+				s.pendingMu.Unlock()
+				if exists {
+					ch <- BackendResponse{
+						RequestID: request.RequestID,
+						Action:    ServerActionResponse,
+						Params:    request.Params,
+					}
+				} else {
+					log.Printf("No pending response channel for request %s", request.RequestID)
+				}
+			default:
+				if action, ok := s.WebsocketActions[request.Action]; ok {
+					action(request.Params)
+				}
 			}
+		case <-s.done:
+			return
 		}
 	}
 }
