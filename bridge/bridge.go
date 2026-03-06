@@ -21,7 +21,7 @@ func NewBridge() *Bridge {
 	// Load configuration
 	cfg := config.LoadConfig()
 
-	_backend := backend.NewTCPServer()
+	_backend := backend.NewTCPServerWithQueueSize(cfg.QueueSize)
 	_backend.WebsocketActions = make(map[backend.ServerActions]func(map[string]any))
 
 	onConnectionRequest := func(r *http.Request) (map[string]any, error) {

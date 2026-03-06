@@ -55,16 +55,29 @@ type TCPServer struct {
 	PendingResponses      map[string]chan BackendResponse // Responses pending from the backend(python)
 	done                  chan struct{}                   // signals shutdown
 
+	// Message queue for when no backends are connected
+	messageQueue []BackendRequest
+	queueMu      sync.Mutex
+	maxQueueSize int // 0 = disabled, >0 = max buffered messages
+
 	WebsocketActions map[ServerActions]func(map[string]any)
 }
 
 // NewTCPServer creates a new TCP server instance
 func NewTCPServer() *TCPServer {
+	return NewTCPServerWithQueueSize(1000)
+}
+
+// NewTCPServerWithQueueSize creates a new TCP server with a configurable queue size.
+// queueSize=0 disables queuing (messages dropped when no backends connected).
+func NewTCPServerWithQueueSize(queueSize int) *TCPServer {
 	server := &TCPServer{
 		Clients:               make([]net.Conn, 0),
 		PendingServerRequests: make(chan BackendAction, 256),
 		PendingResponses:      make(map[string]chan BackendResponse),
 		done:                  make(chan struct{}),
+		messageQueue:          make([]BackendRequest, 0),
+		maxQueueSize:          queueSize,
 	}
 	return server
 }
@@ -181,8 +194,13 @@ func (s *TCPServer) acceptConnections() {
 
 		s.mu.Lock()
 		s.Clients = append(s.Clients, conn)
+		clientCount := len(s.Clients)
 		s.mu.Unlock()
-		log.Println("Accepted connection", len(s.Clients))
+		log.Println("Accepted connection", clientCount)
+
+		// Flush queued messages now that a backend is available
+		go s.flushQueue()
+
 		go s.handleConnection(conn)
 	}
 }
@@ -246,7 +264,9 @@ func (s *TCPServer) pingBackends() {
 	}
 }
 
-// sendMessage sends a message to a random backend client
+// sendMessage sends a message to a random backend client.
+// If no backends are connected and queuing is enabled, the message is buffered.
+// Connection requests are NEVER queued (they require a synchronous response).
 func (s *TCPServer) sendMessage(_message BackendRequest) error {
 	message, err := json.Marshal(_message)
 	if err != nil {
@@ -254,12 +274,74 @@ func (s *TCPServer) sendMessage(_message BackendRequest) error {
 	}
 	conn, ok := s.GetRandomConnection()
 	if !ok {
-		return errors.New("no connection available")
+		// Connection requests must NOT be queued — they need a sync response
+		if _message.Action == BackendActionConnectionRequest {
+			return errors.New("no backend available to handle connection request")
+		}
+		return s.enqueue(_message)
 	}
 	writer := bufio.NewWriter(conn)
 	writer.WriteString(string(message) + "\n")
 	log.Println("Sent message to", conn.RemoteAddr())
 	return writer.Flush()
+}
+
+// enqueue adds a message to the queue when no backends are available.
+// Returns an error if queuing is disabled (maxQueueSize=0).
+func (s *TCPServer) enqueue(msg BackendRequest) error {
+	if s.maxQueueSize == 0 {
+		return errors.New("no connection available (queue disabled)")
+	}
+
+	s.queueMu.Lock()
+	defer s.queueMu.Unlock()
+
+	// Drop oldest if queue is full
+	if len(s.messageQueue) >= s.maxQueueSize {
+		dropped := s.messageQueue[0]
+		s.messageQueue = s.messageQueue[1:]
+		log.Printf("Queue full (%d), dropped oldest message: %s", s.maxQueueSize, dropped.RequestID)
+	}
+
+	s.messageQueue = append(s.messageQueue, msg)
+	log.Printf("Message queued (%d/%d): %s %s", len(s.messageQueue), s.maxQueueSize, msg.Action, msg.RequestID)
+	return nil
+}
+
+// flushQueue drains all queued messages to the connected backends.
+// Called when a new backend connects.
+func (s *TCPServer) flushQueue() {
+	s.queueMu.Lock()
+	if len(s.messageQueue) == 0 {
+		s.queueMu.Unlock()
+		return
+	}
+	// Take ownership of the queue and reset it
+	queue := s.messageQueue
+	s.messageQueue = make([]BackendRequest, 0)
+	s.queueMu.Unlock()
+
+	log.Printf("Flushing %d queued messages to backend", len(queue))
+	for i, msg := range queue {
+		if err := s.sendMessage(msg); err != nil {
+			// Backend went down again mid-flush — re-queue remaining (unsent ones)
+			remaining := queue[i:]
+			log.Printf("Flush interrupted at %d/%d: %v, re-queuing %d messages", i, len(queue), err, len(remaining))
+			s.queueMu.Lock()
+			// Prepend unsent messages back (they're older, should go first)
+			s.messageQueue = append(remaining, s.messageQueue...)
+			s.queueMu.Unlock()
+			return
+		}
+	}
+	log.Printf("Queue flushed successfully")
+}
+
+// QueueLen returns the current number of queued messages.
+func (s *TCPServer) QueueLen() int {
+	s.queueMu.Lock()
+	defer s.queueMu.Unlock()
+	return len(s.messageQueue)
 }
 
 // GetRandomConnection returns a random connection from the active clients
