@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Run tests
+        run: go test -race -v ./...
+
+      - name: Build binaries
+        run: |
+          mkdir -p dist
+          GOOS=linux GOARCH=amd64 go build -o dist/pystrands-server-linux-amd64 .
+          GOOS=linux GOARCH=arm64 go build -o dist/pystrands-server-linux-arm64 .
+          GOOS=darwin GOARCH=amd64 go build -o dist/pystrands-server-darwin-amd64 .
+          GOOS=darwin GOARCH=arm64 go build -o dist/pystrands-server-darwin-arm64 .
+          GOOS=windows GOARCH=amd64 go build -o dist/pystrands-server-windows-amd64.exe .
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
