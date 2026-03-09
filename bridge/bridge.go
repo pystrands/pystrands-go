@@ -25,7 +25,7 @@ func NewBridge() *Bridge {
 	_backend.WebsocketActions = make(map[backend.ServerActions]func(map[string]any))
 
 	onConnectionRequest := func(r *http.Request) (map[string]any, error) {
-		metaData, err := _backend.NewSocketConnection(r.Header, r.URL.Path, r.RemoteAddr)
+		metaData, err := _backend.NewSocketConnection(r.Header, r.URL.RequestURI(), r.RemoteAddr)
 		if err != nil {
 			_backend.HandleError(map[string]any{
 				"headers":     r.Header,

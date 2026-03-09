@@ -138,11 +138,17 @@ func (s *WebSocketServer) HandleConnection(w http.ResponseWriter, r *http.Reques
 		s.rooms[roomID] = room
 	}
 
+	// Extract only user-defined metadata (not the protocol fields)
+	clientMetaData, _ := metaData["metadata"].(map[string]any)
+	if clientMetaData == nil {
+		clientMetaData = make(map[string]any)
+	}
+
 	// Add client to the map
 	cc := &connClient{
 		Client: Client{
 			Conn:     conn,
-			MetaData: metaData,
+			MetaData: clientMetaData,
 			RoomID:   roomID,
 			ClientID: metaData["client_id"].(string),
 		},
